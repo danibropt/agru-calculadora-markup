@@ -9,7 +9,7 @@ st.set_page_config(page_title="Calculadora de Markup & Descontos AGRU", layout="
 st.title("📊 Análise Comercial: Markup, Impostos e Descontos")
 st.markdown("Automação para apuração de preços líquidos, markups estimados/reais e recálculo de descontos sucessivos.")
 
-# --- BARRA LATERAL: PARÂMETROS E UPLOAD DAS BASES ---
+# --- BARRA LATERAL: PARÂMETROS E BASES ---
 with st.sidebar:
     st.header("⚙️ 1. Arquivos de Custos")
     
@@ -32,31 +32,31 @@ def col2idx(col_letter):
         idx = idx * 26 + (ord(c) - ord('A') + 1)
     return idx - 1
 
-# --- CARREGAMENTO DAS BASES DE CUSTOS ---
+# --- CARREGAMENTO DAS BASES DE CUSTOS COM FALLBACK INTELIGENTE ---
 @st.cache_data
 def carregar_bases(file_lp, col_lp_cod_idx, col_lp_idx, file_ev, col_c_idx, col_an_idx):
     custos = {}
     
-    # 1. Lista de Preços (Custo Estimado Landed)
+    # 1. Carrega Lista de Preços (Coluna C padrão)
     if file_lp is not None:
         try:
             df_lp = pd.read_excel(file_lp, sheet_name=0)
             for _, row in df_lp.iterrows():
                 if col_lp_cod_idx < len(row):
-                    code_raw = str(row.iloc[col_lp_cod_idx]).split('.')[0].strip()
-                    if code_raw and code_raw != 'nan':
+                    code_raw = str(row.iloc[col_lp_cod_idx]).split('.')[0].strip().upper()
+                    if code_raw and code_raw != 'NAN':
                         val = pd.to_numeric(row.iloc[col_lp_idx], errors='coerce') if col_lp_idx < len(row) else 0.0
                         custos[code_raw] = {'custo_landed': float(val) if pd.notnull(val) else 0.0, 'custo_real': 0.0}
         except Exception as e:
             st.error(f"Erro ao ler Lista de Preços: {e}")
 
-    # 2. Evolução de Custos (Maior valor entre Protheus e Rotação)
+    # 2. Carrega Evolução de Custos (Maior valor entre Protheus e Rotação)
     if file_ev is not None:
         try:
             df_ev = pd.read_excel(file_ev, sheet_name=0)
             for _, row in df_ev.iterrows():
-                code_raw = str(row.iloc[0]).split('.')[0].strip()
-                if code_raw and code_raw != 'nan':
+                code_raw = str(row.iloc[0]).split('.')[0].strip().upper()
+                if code_raw and code_raw != 'NAN':
                     val_c = pd.to_numeric(row.iloc[col_c_idx], errors='coerce') if col_c_idx < len(row) else 0.0
                     val_an = pd.to_numeric(row.iloc[col_an_idx], errors='coerce') if col_an_idx < len(row) else 0.0
                     val_c = float(val_c) if pd.notnull(val_c) else 0.0
@@ -65,19 +65,22 @@ def carregar_bases(file_lp, col_lp_cod_idx, col_lp_idx, file_ev, col_c_idx, col_
                     
                     if code_raw in custos:
                         custos[code_raw]['custo_real'] = maior_real
+                        # Se Landed for zero ou não existir, adota o Custo Real como referência
+                        if custos[code_raw]['custo_landed'] == 0.0 and maior_real > 0.0:
+                            custos[code_raw]['custo_landed'] = maior_real
                     else:
-                        custos[code_raw] = {'custo_landed': 0.0, 'custo_real': maior_real}
+                        custos[code_raw] = {'custo_landed': maior_real, 'custo_real': maior_real}
         except Exception as e:
             st.error(f"Erro ao ler Evolução de Custos: {e}")
             
     return custos
 
-# --- PARSER DEFINITIVO DO PDF DA PROPOSTA ---
+# --- PARSER DO PDF COM SUPORTE A CÓDIGOS ALFANUMÉRICOS ---
 def parse_proposta_pdf(uploaded_pdf):
     reader = pypdf.PdfReader(uploaded_pdf)
     full_text = "\n".join([page.extract_text() or "" for page in reader.pages])
     
-    # 1. Impostos destacados nas observações (ICMS, PIS e COFINS)
+    # 1. Impostos destacados nas observações
     imp_match = re.search(r'Impostos\s+inclu[íi]dos:\s*([^.\n\r]+)', full_text, re.IGNORECASE)
     aliquotas = []
     detalhe_impostos = ""
@@ -100,34 +103,35 @@ def parse_proposta_pdf(uploaded_pdf):
     frete_match = re.search(r'\bFRETE\s+([0-9.,]+)', full_text)
     frete_destacado = float(frete_match.group(1).replace('.', '').replace(',', '.')) if frete_match else 0.0
 
-    # 4. Itens da Proposta
-    item_matches = list(re.finditer(r'(\d+\.\d+)\s*(\d{11})', full_text))
+    # 4. Itens da Proposta (aceita números e letras de 5 a 15 caracteres)
+    item_matches = list(re.finditer(r'(\d+\.\d+)\s*([A-Z0-9]{5,15})', full_text))
     fim_tabela = re.search(r'\n\s*VENDEDOR\b', full_text)
     fim_idx = fim_tabela.start() if fim_tabela else len(full_text)
     
     itens = []
     for i, m in enumerate(item_matches):
         pos = m.group(1)
-        cod = m.group(2)
+        cod = m.group(2).strip().upper()
         start = m.end()
         end = item_matches[i+1].start() if (i + 1 < len(item_matches)) else fim_idx
         bloco = full_text[start:end].strip()
         
-        # Padrão numérico final: NCM(8) + ST% + IPI% + QTD + UN + [UNITÁRIO + SUBTOTAL]
-        vals_match = re.search(r'(\d{8})\s*([0-9.,]+)%\s*([0-9.,]+)%\s*([0-9.,]+)\s*([A-Z]{2})\s*(.*)', bloco, re.DOTALL)
+        # Limpa previamente datas e prazos que possam vir colados no NCM
+        bloco_clean = re.sub(r'(Imediata|\d+\s*dias|\d{2}/\d{2}/\d{4})\s*', ' ', bloco, flags=re.IGNORECASE)
+        
+        # NCM(8) + ST% + IPI% + QTD + UN + [PREÇOS]
+        vals_match = re.search(r'(\d{8})\s*([0-9.,]+)%\s*([0-9.,]+)%\s*([0-9.,]+)\s*([A-Z]{2})\s*(.*)', bloco_clean, re.DOTALL)
         if vals_match:
             ncm = vals_match.group(1)
             qtd_str = vals_match.group(4)
             un = vals_match.group(5)
             resto_precos = vals_match.group(6).strip()
             
-            desc_raw = bloco[:vals_match.start()].strip()
-            desc_raw = re.sub(r'(Imediata|\d+\s*dias|\d{2}/\d{2}/\d{4})\s*$', '', desc_raw, flags=re.IGNORECASE).strip()
+            desc_raw = bloco_clean[:vals_match.start()].strip()
             desc = " ".join(desc_raw.split())
             
             qtd = float(qtd_str.replace('.', '').replace(',', '.'))
             
-            # Tratamento para separar valores unitários e subtotais (mesmo se vierem colados)
             resto_clean = " ".join(resto_precos.split())
             parts = resto_clean.split()
             if len(parts) >= 2:
@@ -221,10 +225,9 @@ if pdf_file is not None:
             sub_novo = sub_orig * fator_mult_preco
             unit_novo = sub_novo / qtd
             
-            # Preço sem impostos = Faturado * (1 - alíquotas)
+            # Preço sem impostos = Faturado * (1 - soma das alíquotas)
             unit_sem_imp = unit_novo * fator_liquido
             
-            # Rateio do frete embutido
             rateio_frete_item = ((sub_orig / subtotal_faturado_total) * valor_frete_embutido) if (tem_frete_embutido and subtotal_faturado_total > 0) else 0.0
             unit_frete = rateio_frete_item / qtd
             unit_liquido_efetivo = unit_sem_imp - (unit_frete * fator_liquido)
@@ -232,6 +235,10 @@ if pdf_file is not None:
             info_c = custos_db.get(cod, {'custo_landed': 0.0, 'custo_real': 0.0})
             c_est = info_c['custo_landed']
             c_real = info_c['custo_real']
+            
+            # Regra de contingência: se Landed for zero, herda Custo Real
+            if c_est == 0.0 and c_real > 0.0:
+                c_est = c_real
             
             dados.append({
                 'Item': it['pos'],
